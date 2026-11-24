@@ -5,7 +5,6 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-from collections import defaultdict
 from flask import Flask, request, jsonify
 
 # =========================
@@ -25,11 +24,13 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
-
 log = logging.getLogger("syria_store")
 
+PAGE_SIZE = 10
+
+
 # =========================
-# HTTP REQUEST
+# HTTP
 # =========================
 
 def request_json(url, headers=None, data=None):
@@ -53,20 +54,9 @@ def request_json(url, headers=None, data=None):
             return json.loads(raw)
 
     except urllib.error.HTTPError as error:
-        body = error.read().decode(
-            "utf-8",
-            errors="replace"
-        )
-
-        log.error(
-            "HTTP ERROR %s: %s",
-            error.code,
-            body[:1500]
-        )
-
-        raise RuntimeError(
-            f"HTTP {error.code}: {body[:300]}"
-        )
+        body = error.read().decode("utf-8", errors="replace")
+        log.error("HTTP ERROR %s: %s", error.code, body[:1500])
+        raise RuntimeError(f"HTTP {error.code}: {body[:300]}")
 
     except urllib.error.URLError as error:
         log.error("CONNECTION ERROR: %s", error.reason)
@@ -101,7 +91,7 @@ def telegram(method, data):
 def send(chat_id, text, keyboard=None):
     data = {
         "chat_id": chat_id,
-        "text": text
+        "text": str(text)
     }
 
     if keyboard:
@@ -111,6 +101,23 @@ def send(chat_id, text, keyboard=None):
         )
 
     return telegram("sendMessage", data)
+
+
+def send_photo(chat_id, photo_url, caption):
+    data = {
+        "chat_id": chat_id,
+        "photo": photo_url,
+        "caption": caption[:1024]
+    }
+
+    return telegram("sendPhoto", data)
+
+
+def answer_callback(callback_id, text=""):
+    return telegram("answerCallbackQuery", {
+        "callback_query_id": callback_id,
+        "text": text
+    })
 
 
 # =========================
@@ -123,9 +130,7 @@ def shop_get(path):
 
     return request_json(
         SHOP_API + path,
-        headers={
-            "api-token": API_TOKEN
-        }
+        headers={"api-token": API_TOKEN}
     )
 
 
@@ -144,10 +149,7 @@ def get_products():
                 break
 
         if products is None:
-            log.error(
-                "Unexpected Gunes response: %s",
-                repr(result)[:2000]
-            )
+            log.error("Unexpected Gunes response: %s", repr(result)[:2000])
             raise RuntimeError("Unexpected products response")
 
     else:
@@ -155,18 +157,51 @@ def get_products():
 
     log.info("Gunes products received: %s", len(products))
 
-    return [
-        p for p in products
-        if isinstance(p, dict)
-    ]
+    # فحص أسماء حقول الصور في سجل Render
+    if products:
+        log.info("PRODUCT FIELDS: %s", list(products[0].keys()))
+
+    return [p for p in products if isinstance(p, dict)]
 
 
 def is_available(product):
     value = product.get("available")
+    return value is True or str(value).lower() in ("1", "true", "yes")
 
-    return value is True or str(value).lower() in (
-        "1", "true", "yes"
+
+# =========================
+# IMAGE DETECTION
+# =========================
+
+def get_product_image(product):
+    image_keys = (
+        "image",
+        "image_url",
+        "photo",
+        "photo_url",
+        "icon",
+        "icon_url",
+        "logo",
+        "logo_url",
+        "thumbnail",
+        "thumbnail_url",
+        "picture",
+        "picture_url"
     )
+
+    for key in image_keys:
+        value = product.get(key)
+
+        if isinstance(value, str) and value.startswith(("https://", "http://")):
+            return value
+
+        if isinstance(value, dict):
+            for subkey in ("url", "src", "link"):
+                url = value.get(subkey)
+                if isinstance(url, str) and url.startswith(("https://", "http://")):
+                    return url
+
+    return None
 
 
 # =========================
@@ -193,106 +228,168 @@ def main_menu():
 
 
 # =========================
-# PRODUCTS
+# PRODUCT FILTER
 # =========================
 
-def show_products(chat_id, category_filter=None):
-    try:
-        products = get_products()
+def filter_products(category):
+    products = [
+        p for p in get_products()
+        if is_available(p)
+    ]
 
-        available = [
+    if category == "game":
+        products = [
             p for p in products
-            if is_available(p)
+            if "game" in str(p.get("category_name", "")).lower()
+            or "game" in str(p.get("name", "")).lower()
         ]
 
-        if category_filter:
-            available = [
-                p for p in available
-                if category_filter.lower() in
-                str(p.get("category_name", "")).lower()
-                or category_filter.lower() in
-                str(p.get("name", "")).lower()
-            ]
+    elif category == "app":
+        products = [
+            p for p in products
+            if "app" in str(p.get("category_name", "")).lower()
+            or "app" in str(p.get("name", "")).lower()
+        ]
 
-        log.info(
-            "Products total=%s available=%s",
-            len(products),
-            len(available)
-        )
+    return products
 
-        if not available:
-            send(chat_id, "لا توجد منتجات متاحة في هذا القسم حالياً.")
+
+# =========================
+# PRODUCT PAGES
+# =========================
+
+def show_products(chat_id, category="all", page=0):
+    try:
+        products = filter_products(category)
+
+        if not products:
+            send(chat_id, "لا توجد منتجات متاحة حالياً.")
             return
 
-        # Group by category
-        groups = defaultdict(list)
+        total = len(products)
+        total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
 
-        for product in available:
-            category = product.get(
-                "category_name",
-                "منتجات أخرى"
-            )
-            groups[str(category)].append(product)
+        if page < 0:
+            page = 0
+
+        if page >= total_pages:
+            page = total_pages - 1
+
+        start = page * PAGE_SIZE
+        current = products[start:start + PAGE_SIZE]
+
+        keyboard = []
+
+        for product in current:
+            name = str(product.get("name", "منتج"))
+            price = str(product.get("price", "?"))
+            product_id = product.get("id")
+
+            if product_id is None:
+                continue
+
+            button_text = f"{name} - {price}$"
+
+            keyboard.append([
+                {
+                    "text": button_text[:60],
+                    "callback_data": f"pr|{product_id}"
+                }
+            ])
+
+        navigation = []
+
+        if page > 0:
+            navigation.append({
+                "text": "⬅️ السابق",
+                "callback_data": f"pg|{category}|{page - 1}"
+            })
+
+        if page < total_pages - 1:
+            navigation.append({
+                "text": "التالي ➡️",
+                "callback_data": f"pg|{category}|{page + 1}"
+            })
+
+        if navigation:
+            keyboard.append(navigation)
+
+        markup = {
+            "inline_keyboard": keyboard
+        }
+
+        category_names = {
+            "all": "جميع المنتجات",
+            "game": "الألعاب",
+            "app": "التطبيقات"
+        }
 
         send(
             chat_id,
-            f"📦 المنتجات المتاحة: {len(available)}\n"
-            f"عدد الأقسام: {len(groups)}"
+            f"🛍️ سوريا ستور\n"
+            f"📂 القسم: {category_names.get(category, category)}\n"
+            f"📦 عدد المنتجات: {total}\n"
+            f"📄 الصفحة: {page + 1} من {total_pages}\n\n"
+            f"اختر المنتج الذي تريده:",
+            markup
         )
-
-        sent = 0
-
-        for category, items in groups.items():
-            send(
-                chat_id,
-                f"📂 القسم: {category}\n"
-                f"عدد المنتجات: {len(items)}"
-            )
-
-            for product in items:
-                if sent >= 40:
-                    send(
-                        chat_id,
-                        "تم عرض أول 40 منتجاً. "
-                        "يمكنك طلب بقية المنتجات لاحقاً."
-                    )
-                    return
-
-                name = product.get("name", "منتج")
-                price = product.get("price", "?")
-                product_id = product.get("id")
-                qty = product.get("qty_values")
-                product_type = product.get(
-                    "product_type",
-                    "غير محدد"
-                )
-
-                message = (
-                    f"📦 {name}\n"
-                    f"💵 السعر: {price}\n"
-                    f"🆔 رقم المنتج: {product_id}\n"
-                    f"🔢 نوع المنتج: {product_type}"
-                )
-
-                if qty is not None:
-                    message += (
-                        "\n🔢 الكميات: "
-                        + str(qty)
-                    )
-                else:
-                    message += "\n🔢 الكمية المطلوبة: 1"
-
-                send(chat_id, message)
-                sent += 1
 
     except Exception:
         log.exception("Products loading failed")
+        send(chat_id, "تعذر تحميل المنتجات حالياً.")
 
-        send(
-            chat_id,
-            "تعذر تحميل المنتجات حالياً.\n"
-            "تم تسجيل تفاصيل المشكلة للفحص."
+
+# =========================
+# PRODUCT DETAILS
+# =========================
+
+def show_product_details(chat_id, product_id):
+    try:
+        products = get_products()
+
+        product = next(
+            (
+                p for p in products
+                if str(p.get("id")) == str(product_id)
+            ),
+            None
         )
+
+        if not product:
+            send(chat_id, "لم يتم العثور على هذا المنتج.")
+            return
+
+        name = product.get("name", "منتج")
+        price = product.get("price", "?")
+        qty = product.get("qty_values")
+        product_type = product.get("product_type", "غير محدد")
+
+        message = (
+            f"📦 {name}\n"
+            f"💵 السعر: {price}\n"
+            f"🆔 رقم المنتج: {product_id}\n"
+            f"🔢 نوع المنتج: {product_type}"
+        )
+
+        if qty is not None:
+            message += f"\n🔢 الكميات: {qty}"
+        else:
+            message += "\n🔢 الكمية المطلوبة: 1"
+
+        image_url = get_product_image(product)
+
+        if image_url:
+            try:
+                send_photo(chat_id, image_url, message)
+                return
+            except Exception:
+                log.exception("Product image sending failed")
+
+        send(chat_id, message)
+
+    except Exception:
+        log.exception("Product details failed")
+        send(chat_id, "تعذر عرض تفاصيل المنتج حالياً.")
 
 
 # =========================
@@ -310,17 +407,12 @@ def show_balance(chat_id):
 
         send(
             chat_id,
-            f"💰 رصيد متجر الشحن\n\n"
-            f"الرصيد: {balance}"
+            f"💰 رصيد متجر الشحن\n\nالرصيد: {balance}"
         )
 
     except Exception:
         log.exception("Balance loading failed")
-
-        send(
-            chat_id,
-            "تعذر جلب الرصيد حالياً."
-        )
+        send(chat_id, "تعذر جلب الرصيد حالياً.")
 
 
 # =========================
@@ -337,22 +429,18 @@ def handle_message(message):
     if text == "/start":
         send(
             chat_id,
-            "🌟 أهلاً بك في سوريا ستور\n\n"
-            "اختر الخدمة التي تريدها:",
+            "🌟 أهلاً بك في سوريا ستور\n\nاختر الخدمة التي تريدها:",
             main_menu()
         )
 
-    elif text in (
-        "📦 جميع المنتجات",
-        "📦 منتجات الشحن"
-    ):
-        show_products(chat_id)
+    elif text in ("📦 جميع المنتجات", "📦 منتجات الشحن"):
+        show_products(chat_id, "all", 0)
 
     elif text == "🎮 الألعاب":
-        show_products(chat_id, "game")
+        show_products(chat_id, "game", 0)
 
     elif text == "📱 التطبيقات":
-        show_products(chat_id, "app")
+        show_products(chat_id, "app", 0)
 
     elif text == "💰 رصيدي":
         show_balance(chat_id)
@@ -365,11 +453,45 @@ def handle_message(message):
         )
 
     else:
-        send(
-            chat_id,
-            "اختر خدمة من القائمة:",
-            main_menu()
-        )
+        send(chat_id, "اختر خدمة من القائمة:", main_menu())
+
+
+# =========================
+# CALLBACK HANDLER
+# =========================
+
+def handle_callback(callback):
+    callback_id = callback.get("id")
+    data = callback.get("data", "")
+    message = callback.get("message", {})
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+
+    if not callback_id or not chat_id:
+        return
+
+    try:
+        parts = data.split("|")
+
+        if parts[0] == "pg" and len(parts) == 3:
+            category = parts[1]
+            page = int(parts[2])
+
+            answer_callback(callback_id)
+            show_products(chat_id, category, page)
+
+        elif parts[0] == "pr" and len(parts) == 2:
+            product_id = parts[1]
+
+            answer_callback(callback_id, "جاري تحميل المنتج...")
+            show_product_details(chat_id, product_id)
+
+        else:
+            answer_callback(callback_id, "طلب غير معروف")
+
+    except Exception:
+        log.exception("Callback handling failed")
+        answer_callback(callback_id, "حدث خطأ، حاول مرة أخرى.")
 
 
 # =========================
@@ -385,14 +507,15 @@ def home():
 def webhook():
     update = request.get_json(silent=True) or {}
 
-    message = update.get("message")
+    try:
+        if update.get("message"):
+            handle_message(update["message"])
 
-    if message:
-        try:
-            handle_message(message)
+        elif update.get("callback_query"):
+            handle_callback(update["callback_query"])
 
-        except Exception:
-            log.exception("Message handling failed")
+    except Exception:
+        log.exception("Webhook handling failed")
 
     return jsonify({"ok": True})
 
@@ -415,12 +538,16 @@ def main():
 
     result = telegram(
         "setWebhook",
-        {"url": webhook_url}
+        {
+            "url": webhook_url,
+            "allowed_updates": json.dumps(
+                ["message", "callback_query"]
+            )
+        }
     )
 
     log.info("Webhook setup: %s", result)
 
-    # Test Gunes connection on startup
     try:
         profile = shop_get("profile")
         log.info(
