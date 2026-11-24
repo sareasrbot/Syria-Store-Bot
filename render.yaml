@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: syria-store-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    disk:
+      name: syria-store-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GUNES_API_TOKEN
+        sync: false
+      - key: RENDER_EXTERNAL_URL
+        sync: false
+      - key: ADMIN_TELEGRAM_ID
+        value: "8214089375"
+      - key: DB_PATH
+        value: /var/data/syria_store.db
+      - key: STORE_MARKUP_PERCENT
+        value: "10"
